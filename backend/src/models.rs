@@ -8,6 +8,7 @@ use crate::{AuthBackend, DuckDBStore};
 #[derive(Clone)]
 pub struct AppState {
     pub upload_dir: PathBuf,
+    pub upload_dir_canonical: PathBuf,
     pub db: Arc<Mutex<duckdb::Connection>>,
     pub max_size: u64,
     pub max_size_label: String,
@@ -107,4 +108,16 @@ pub struct PublishResponse {
 pub struct PublicTileUrl {
     pub slug: String,
     pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicTileMeta {
+    pub slug: String,
+    pub name: String,
+    #[serde(rename = "tileSource")]
+    pub tile_source: String,
+    #[serde(rename = "tileUrl")]
+    pub tile_url: String,
+    #[serde(rename = "viewerUrl")]
+    pub viewer_url: String,
 }
