@@ -459,7 +459,7 @@ async fn test_upload_invalid_shapefile_zip_returns_400() {
     {
         let cursor = std::io::Cursor::new(&mut zip_bytes);
         let mut zip = zip::ZipWriter::new(cursor);
-        let options = zip::write::FileOptions::default();
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
         zip.start_file("readme.txt", options).unwrap();
         std::io::Write::write_all(&mut zip, b"not a shapefile").unwrap();
         zip.finish().unwrap();
