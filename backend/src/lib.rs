@@ -1,6 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -54,8 +54,8 @@ use http_errors::{bad_request, internal_error, payload_too_large};
 use import::import_spatial_data;
 use mbtiles::import_mbtiles;
 pub use models::{
-    AppState, ErrorResponse, FileItem, FileSchemaResponse, PreviewMeta, PublicTileUrl,
-    PublishRequest, PublishResponse,
+    AppState, ErrorResponse, FileItem, FileSchemaResponse, PreviewMeta, PublicTileMeta,
+    PublicTileUrl, PublishRequest, PublishResponse,
 };
 use models::{FeaturePropertiesResponse, FeatureProperty};
 pub use password::{hash_password, validate_password_complexity, verify_password, PasswordError};
@@ -111,7 +111,12 @@ fn build_api_router_with_auth(state: AppState, with_auth: bool) -> Router {
     let public_router = Router::new()
         .route("/health", get(health_check))
         .route("/api/test/is-initialized", get(check_is_initialized))
-        .route("/tiles/{slug}/{z}/{x}/{y}", get(get_public_tile));
+        .route("/tiles/{slug}/{z}/{x}/{y}", get(get_public_tile))
+        .route(
+            "/tiles/{slug}",
+            get(get_public_pmtiles).head(head_public_pmtiles),
+        )
+        .route("/tiles/{slug}/meta", get(get_public_tile_meta));
 
     let mut api_router = Router::new()
         .route("/api/files", get(list_files))
@@ -683,7 +688,7 @@ async fn upload_file(
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| format!(".{}", ext.to_lowercase()))
-        .ok_or_else(|| bad_request("Unsupported file type. Use .zip, .geojson, .json, .geojsonl, .kml, .gpx, .topojson, or .mbtiles"))?;
+        .ok_or_else(|| bad_request("Unsupported file type. Use .zip, .geojson, .json, .geojsonl, .kml, .gpx, .topojson, .mbtiles, or .pmtiles"))?;
 
     let file_type = match ext.as_str() {
         ".zip" => "shapefile",
@@ -693,8 +698,9 @@ async fn upload_file(
         ".gpx" => "gpx",
         ".topojson" => "topojson",
         ".mbtiles" => "mbtiles",
+        ".pmtiles" => "pmtiles",
         _ => return Err(bad_request(
-            "Unsupported file type. Use .zip, .geojson, .json, .geojsonl, .kml, .gpx, .topojson, or .mbtiles",
+            "Unsupported file type. Use .zip, .geojson, .json, .geojsonl, .kml, .gpx, .topojson, .mbtiles, or .pmtiles",
         )),
     };
 
@@ -729,8 +735,9 @@ async fn upload_file(
         "shapefile" => validate_shapefile_zip(&file_path).await,
         "geojson" => validate_geojson(&file_path).await,
         "mbtiles" => mbtiles::validate_mbtiles_structure(&file_path),
+        "pmtiles" => Ok(()), // PMTiles files are stored as-is, validated by frontend
         "geojsonl" | "kml" | "gpx" | "topojson" => Ok(()), // Trust GDAL to validate
-        _ => Ok(()), // Unreachable due to earlier validation, but required for type safety
+        _ => Ok(()),         // Unreachable due to earlier validation, but required for type safety
     };
 
     let uploaded_at = Utc::now().to_rfc3339();
@@ -810,6 +817,15 @@ async fn upload_file(
 
         let result = match file_type_clone.as_str() {
             "mbtiles" => import_mbtiles(&db, &upload_id_clone, &file_path_clone).await,
+            "pmtiles" => {
+                // PMTiles files are stored as-is, just mark as ready
+                let conn = db.lock().await;
+                let _ = conn.execute(
+                    "UPDATE files SET status = 'ready', tile_source = 'pmtiles' WHERE id = ?",
+                    duckdb::params![upload_id_clone],
+                );
+                Ok(())
+            }
             _ => import_spatial_data(&db, &upload_id_clone, &file_path_clone).await,
         };
 
@@ -893,11 +909,11 @@ async fn publish_file(
         .map_err(internal_error)?;
 
     // Check file status within transaction to provide better error messages
-    let (status, _name): (String, String) = conn
+    let (status, _name, tile_source): (String, String, String) = conn
         .query_row(
-            "SELECT status, name FROM files WHERE id = ?",
+            "SELECT status, name, COALESCE(tile_source, 'duckdb') FROM files WHERE id = ?",
             duckdb::params![&id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| {
             (
@@ -920,8 +936,8 @@ async fn publish_file(
     }
 
     let insert_result = conn.execute(
-        "INSERT INTO published_files (file_id, slug) VALUES (?, ?)",
-        duckdb::params![&id, &slug],
+        "INSERT INTO published_files (file_id, slug, tile_source) VALUES (?, ?, ?)",
+        duckdb::params![&id, &slug, &tile_source],
     );
 
     let publish_result: Result<(), String> = match insert_result {
@@ -991,8 +1007,13 @@ async fn publish_file(
         Ok(()) => {
             conn.execute_batch("COMMIT").map_err(internal_error)?;
             drop(conn);
+            let url = if tile_source == "pmtiles" {
+                format!("/tiles/{slug}")
+            } else {
+                format!("/tiles/{slug}/{{z}}/{{x}}/{{y}}")
+            };
             Ok(Json(PublishResponse {
-                url: format!("/tiles/{slug}/{{z}}/{{x}}/{{y}}"),
+                url,
                 slug,
                 is_public: true,
             }))
@@ -1217,6 +1238,329 @@ async fn get_public_tile(
     }
 }
 
+async fn get_public_pmtiles(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let conn = state.db.lock().await;
+
+    let (_file_id, file_path, tile_source): (String, String, String) = conn
+        .query_row(
+            "SELECT f.id, f.path, COALESCE(pf.tile_source, f.tile_source, 'duckdb')
+             FROM files f
+             JOIN published_files pf ON f.id = pf.file_id
+             WHERE pf.slug = ? AND f.is_public = TRUE",
+            duckdb::params![&slug],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Public tile not found".to_string(),
+                }),
+            )
+        })?;
+
+    if tile_source != "pmtiles" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "This endpoint is only for PMTiles files".to_string(),
+            }),
+        ));
+    }
+
+    let file_path = state
+        .upload_dir
+        .join(file_path.strip_prefix("./").unwrap_or(&file_path));
+    let canonical_path = file_path.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "PMTiles file not found".to_string(),
+            }),
+        )
+    })?;
+
+    if !canonical_path.starts_with(&state.upload_dir_canonical) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Access denied".to_string(),
+            }),
+        ));
+    }
+
+    let file = fs::File::open(&canonical_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to open file: {}", e),
+            }),
+        )
+    })?;
+
+    let metadata = file.metadata().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to read metadata: {}", e),
+            }),
+        )
+    })?;
+    let file_size = metadata.len();
+
+    if let Some(range_header) = headers.get(header::RANGE) {
+        let range_str = range_header.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid Range header".to_string(),
+                }),
+            )
+        })?;
+
+        if !range_str.starts_with("bytes=") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid Range header format".to_string(),
+                }),
+            ));
+        }
+
+        let range_spec = &range_str[6..];
+        let parts: Vec<&str> = range_spec.split('-').collect();
+        if parts.len() != 2 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid Range header format".to_string(),
+                }),
+            ));
+        }
+
+        let start: u64 = if parts[0].is_empty() {
+            0
+        } else {
+            parts[0].parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Invalid Range start".to_string(),
+                    }),
+                )
+            })?
+        };
+
+        let end: u64 = if parts[1].is_empty() {
+            file_size - 1
+        } else {
+            parts[1].parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Invalid Range end".to_string(),
+                    }),
+                )
+            })?
+        };
+
+        if start > end || start >= file_size {
+            return Err((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                Json(ErrorResponse {
+                    error: "Range not satisfiable".to_string(),
+                }),
+            ));
+        }
+
+        let actual_end = end.min(file_size - 1);
+        let content_length = actual_end - start + 1;
+
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Seek failed: {}", e),
+                    }),
+                )
+            })?;
+
+        let mut buffer = vec![0u8; content_length as usize];
+        file.read_exact(&mut buffer).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Read failed: {}", e),
+                }),
+            )
+        })?;
+
+        Ok((
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_LENGTH, content_length.to_string().as_str()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, actual_end, file_size).as_str(),
+                ),
+                (header::ACCEPT_RANGES, "bytes"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            buffer,
+        )
+            .into_response())
+    } else {
+        use tokio::io::AsyncReadExt;
+        let mut file = file;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Read failed: {}", e),
+                }),
+            )
+        })?;
+
+        Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_LENGTH, file_size.to_string().as_str()),
+                (header::ACCEPT_RANGES, "bytes"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            buffer,
+        )
+            .into_response())
+    }
+}
+
+async fn head_public_pmtiles(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let conn = state.db.lock().await;
+
+    let (file_path, tile_source): (String, String) = conn
+        .query_row(
+            "SELECT f.path, COALESCE(pf.tile_source, f.tile_source, 'duckdb')
+             FROM files f
+             JOIN published_files pf ON f.id = pf.file_id
+             WHERE pf.slug = ? AND f.is_public = TRUE",
+            duckdb::params![&slug],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Public tile not found".to_string(),
+                }),
+            )
+        })?;
+
+    if tile_source != "pmtiles" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "This endpoint is only for PMTiles files".to_string(),
+            }),
+        ));
+    }
+
+    let file_path = state
+        .upload_dir
+        .join(file_path.strip_prefix("./").unwrap_or(&file_path));
+    let canonical_path = file_path.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "PMTiles file not found".to_string(),
+            }),
+        )
+    })?;
+
+    if !canonical_path.starts_with(&state.upload_dir_canonical) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Access denied".to_string(),
+            }),
+        ));
+    }
+
+    let metadata = fs::metadata(&canonical_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to read metadata: {}", e),
+            }),
+        )
+    })?;
+    let file_size = metadata.len();
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_LENGTH, file_size.to_string().as_str()),
+            (header::ACCEPT_RANGES, "bytes"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+    )
+        .into_response())
+}
+
+async fn get_public_tile_meta(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let conn = state.db.lock().await;
+
+    let (name, tile_source): (String, String) = conn
+        .query_row(
+            "SELECT f.name, COALESCE(pf.tile_source, f.tile_source, 'duckdb')
+             FROM files f
+             JOIN published_files pf ON f.id = pf.file_id
+             WHERE pf.slug = ? AND f.is_public = TRUE",
+            duckdb::params![&slug],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Public tile not found".to_string(),
+                }),
+            )
+        })?;
+
+    let tile_url = if tile_source == "pmtiles" {
+        format!("/tiles/{}", slug)
+    } else {
+        format!("/tiles/{}/{{z}}/{{x}}/{{y}}", slug)
+    };
+    let viewer_url = format!("/tiles/{}", slug);
+
+    Ok(Json(PublicTileMeta {
+        slug: slug.clone(),
+        name,
+        tile_source,
+        tile_url,
+        viewer_url,
+    }))
+}
+
 fn validate_slug(slug: &str) -> Result<String, String> {
     let slug = slug.trim().to_string();
 
@@ -1262,6 +1606,9 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let upload_dir = temp_dir.path().join("uploads");
         fs::create_dir_all(&upload_dir).await.ok();
+        let upload_dir_canonical = upload_dir
+            .canonicalize()
+            .unwrap_or_else(|_| upload_dir.clone());
 
         let conn = duckdb::Connection::open_in_memory().expect("Failed to create test database");
         crate::db::ensure_spatial_extension(&conn).expect("spatial extension");
@@ -1308,6 +1655,7 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
         let state = AppState {
             upload_dir,
+            upload_dir_canonical,
             db: conn.clone(),
             max_size,
             max_size_label: format_bytes(max_size),

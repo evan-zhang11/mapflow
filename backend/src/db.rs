@@ -73,6 +73,14 @@ pub fn init_database(db_path: &Path) -> duckdb::Connection {
     let _ = conn.execute("ALTER TABLE files ADD COLUMN minzoom INTEGER", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN maxzoom INTEGER", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN tile_bounds VARCHAR", []);
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN tile_source VARCHAR DEFAULT 'duckdb'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE published_files ADD COLUMN tile_source VARCHAR DEFAULT 'duckdb'",
+        [],
+    );
 
     conn.execute_batch(
         r"
