@@ -1315,7 +1315,6 @@ async fn test_upload_shapefile_zip_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore = "flaky: DuckDB WAL replay internal error"]
 async fn test_persistence_across_restart_keeps_ready_dataset() {
     let temp_dir = TempDir::new().expect("temp dir");
     let upload_dir = temp_dir.path().join("uploads");
@@ -1360,6 +1359,8 @@ async fn test_persistence_across_restart_keeps_ready_dataset() {
 
     let ready_item = wait_until_ready(&app1, &file_id).await;
     assert_eq!(ready_item.status, "ready");
+
+    drop(app1);
 
     // Simulate restart: new DB connection and router, same DB file + upload dir.
     let conn2 = init_database(&db_path);
